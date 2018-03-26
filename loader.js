@@ -99,7 +99,7 @@ var Module = null;
                                                      get_meta_url(game),
                                                      'document');
                             loading.then(function (data) {
-                                           metadata = data;
+                                           metadata = dict_from_xml(data);
                                            splash.setTitle("Downloading game filelist...");
                                            return fetch_file('Game File List',
                                                              get_files_url(game),
@@ -116,12 +116,17 @@ var Module = null;
                                            }
                                            filelist = data;
                                            splash.setTitle("Downloading emulator metadata...");
-                                           module = metadata.getElementsByTagName("emulator")
-                                                            .item(0)
-                                                            .textContent;
-                                           return fetch_file('Emulator Metadata',
-                                                             get_emulator_config_url(module),
-                                                             'text', true);
+                                           module = metadata.emulator;
+                                           
+                                           var emu_config_file = ("emu-config" in metadata) ? metadata["emu-config"] : "emu_config_extra.xml";
+
+                                           var files = [fetch_file('Emulator Metadata',
+                                                                   get_emulator_config_url(module),
+                                                                   'text', true),
+                                                        fetch_file('Emulator Extra Config',
+                                                                   get_zip_url(emu_config_file, game),
+                                                                   'document', true)];
+                                           return Promise.all(files);
                                          },
                                          function () {
                                            if (splash.failed_loading) {
@@ -136,7 +141,10 @@ var Module = null;
                                              return null;
                                            }
 
-                                           modulecfg = JSON.parse(data);
+                                           [mod_cfg, extra_cfg] = data;
+                                           modulecfg = JSON.parse(mod_cfg);
+                                           extracfg = extra_cfg;
+                                           
                                            var get_files;
 
                                            if (module && module.indexOf("dosbox") === 0) {
@@ -178,9 +186,7 @@ var Module = null;
                                            }
 
                                            if (module && module.indexOf("dosbox") === 0) {
-                                             config_args.push(cfgr.startExe(metadata.getElementsByTagName("emulator_start")
-                                                                                    .item(0)
-                                                                                    .textContent));
+                                             config_args.push(cfgr.startExe(metadata["emulator_start"]));
                                            } else if (module && module.indexOf("sae-") === 0) {
                                              config_args.push(cfgr.model(modulecfg.driver),
                                                               cfgr.rom(modulecfg.bios_filenames));
@@ -192,7 +198,7 @@ var Module = null;
                                            }
 
                                            splash.setTitle("Downloading game data...");
-                                           return Promise.all(get_files(cfgr, metadata, modulecfg, filelist));
+                                           return Promise.all(get_files(cfgr, metadata, modulecfg, filelist, extracfg));
                                          },
                                          function () {
                                            if (splash.failed_loading) {
@@ -227,10 +233,10 @@ var Module = null;
        return get_js_url(filename);
      }
 
-     function get_dosbox_files(cfgr, metadata, modulecfg, filelist) {
+     function get_dosbox_files(cfgr, metadata, modulecfg, filelist, extracfg) {
        var default_drive = "c", // pick any drive letter as a default
            drives = {}, files = [],
-           meta = dict_from_xml(metadata);
+           meta = metadata;
        if (game && game.endsWith(".zip")) {
          drives[default_drive] = game;
        }
@@ -259,7 +265,7 @@ var Module = null;
        return files;
      }
 
-     function get_mame_files(cfgr, metadata, modulecfg, filelist) {
+     function get_mame_files(cfgr, metadata, modulecfg, filelist, extracfg) {
        var files = [],
            bios_files = modulecfg['bios_filenames'];
        bios_files.forEach(function (fname, i) {
@@ -271,9 +277,12 @@ var Module = null;
                             }
                           });
 
-       var meta = dict_from_xml(metadata),
+       var meta = metadata,
            peripherals = {},
+           media_names = {},
            game_files_counter = {};
+
+
        files_with_ext_from_filelist(filelist, meta.emulator_ext).forEach(function (file, i) {
                                                                            game_files_counter[file.name] = 1;
                                                                            if (modulecfg.peripherals && modulecfg.peripherals[i]) {
@@ -285,6 +294,31 @@ var Module = null;
                                                                                peripherals[match[1]] = meta[key];
                                                                                game_files_counter[meta[key]] = 1;
                                                                              });
+                                                                             
+       // Now load from the extra config, if it exists.
+       var extra_media = extracfg.getElementsByTagName("media");
+       for(i = 0; i < extra_media.length; i++) {
+         var section = extra_media[i];
+         
+         var images = section.getElementsByTagName("image");
+         for(j = 0; j < images.length; j++) {
+           var img = images[j];
+           var fn = img.innerHTML;
+           
+           // This currently will break if you're trying to subpath a Zip file;
+           // need to fix so files aren't necessarily automatically loaded
+           game_files_counter[fn] = 1;
+           
+           // If the load attribute was specified, set the proper peripheral.
+           if("load" in img.attributes) peripherals[img.attributes.load.nodeValue] = fn;
+           
+           // If the name attribute was specified, set the name.
+           if("name" in img.attributes) media_names[img.attributes.name.nodeValue] = fn;
+         }
+       }
+
+       // This is maybe a hack, but store the media names list back in the loader.
+       cfgr.mediaNames = media_names;
 
        var game_files = Object.keys(game_files_counter),
            len = game_files.length;
@@ -303,10 +337,23 @@ var Module = null;
        files.push(cfgr.mountFile('/'+ modulecfg['driver'] + '.cfg',
                                  cfgr.fetchOptionalFile("CFG File",
                                                         get_other_emulator_config_url(module))));
+                                                        
+       // TODO: This is hardcoded for now, which is an icky hack. Fix later.
+       files.push(cfgr.mountFile('/mame.lua',
+                                 cfgr.fetchOptionalFile("Lua Script", '/mame.lua')));                          
+       config_args.push(cfgr.extraArgs(['-autoboot_script', '/emulator/mame.lua']));
+       
+       
+       // Attach some info about the images and devices connected to the emulator.
+       emulator.attached = {
+         peripherals: peripherals,
+         media: media_names
+       };
+       
        return files;
      }
 
-     function get_sae_files(cfgr, metadata, modulecfg, filelist) {
+     function get_sae_files(cfgr, metadata, modulecfg, filelist, extracfg) {
        var files = [],
            bios_files = modulecfg['bios_filenames'];
        bios_files.forEach(function (fname, i) {
@@ -318,7 +365,7 @@ var Module = null;
                             }
                           });
 
-       var meta = dict_from_xml(metadata),
+       var meta = metadata,
            game_files = files_with_ext_from_filelist(filelist, meta.emulator_ext);
        game_files.forEach(function (file, i) {
                             if (file) {
@@ -337,7 +384,7 @@ var Module = null;
        return files;
      }
 
-     function get_pce_files(cfgr, metadata, modulecfg, filelist) {
+     function get_pce_files(cfgr, metadata, modulecfg, filelist, extra_cfg) {
        var files = [],
            bios_files = modulecfg['bios_filenames'];
        bios_files.forEach(function (fname, i) {
@@ -349,7 +396,7 @@ var Module = null;
                             }
                           });
 
-       var meta = dict_from_xml(metadata),
+       var meta = metadata,
            game_files_counter = {};
        files_with_ext_from_filelist(filelist, meta.emulator_ext).forEach(function (file, i) {
                                                                            if (modulecfg.peripherals && modulecfg.peripherals[i]) {
@@ -1088,6 +1135,7 @@ var Module = null;
                       if (!game_data || splash.failed_loading) {
                         return null;
                       }
+                      emulator.game_data = game_data;
                       if ("runner" in game_data) {
                         runner = new game_data.runner(canvas, game_data);
                         resizeCanvas(canvas, 1, game_data.nativeResolution, game_data.aspectRatio);
